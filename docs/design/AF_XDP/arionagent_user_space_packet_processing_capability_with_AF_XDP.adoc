@@ -1,0 +1,90 @@
+= User Space Packet Processing Capability with AF_XDP in Arion Agent
+:revnumber: v1.0
+:revdate: 2023 January 24
+:author: Rio Zhu
+:email: zzhu@futurewei.com
+
+:toc: right
+:imagesdir: images
+
+== Overview
+
+This document presents the design and preliminary performance of the user space packet processing capability in Arion Agent with AF_XDP addeed to it.
+
+The following graph shows the final design of this workflow.
+
+image::af_xdp_design.png[AF_XDP Design, 800]
+
+== Design
+
+=== Purpose
+
+Before AF_XDP was added to the Arion Agent, the dataplane of the Arion platform replies completely on the in-kernel XDP program, which has been performant, but also limitting, in terms of kinds of actions can be performed. At the moment, the only scenario we support in in-kernel XDP is neighbor lookup.
+
+To support future features, such as Security Group and Connection Tracking, which is more complicated than neighbor lookup, and requires more data, it would be great for Arion to have a way to process the packet in a way that's fast, and also not limiting. The user space sounds like a good candidate, as it can utilize the power of the whole physical machine, and we can have more complicated logic there. If we are able to let the in-kernel XDP focus on simpler logics, such as receiving and transmitting packets, and let the user space handle the more complicated scenarios, what might create some exciting opportunities for the Arion platform.
+
+=== AF_XDP
+
+AF_XDP is https://pantheon.tech/what-is-af_xdp/[a new type of socket, presented into the Linux Kernel 4.18, which does not completely bypass the kernel, but utilizes its functionality and enables to create something alike DPDK or the AF_Packet.] Under the hood, it has a buffer of memory called `UMEM`, that is shared between the kernel and the user space. AF_XDP has four rings, namely `fill_ring`, `completion_ring`, `rx_ring` and `tx_ring` to manipulate the `UMEM` so that it can receive, redirect and transmit the packets. For more info about AF_XDP, please refer to https://medium.com/high-performance-network-programming/recapitulating-af-xdp-ef6c1ebead8[this Medium post].
+
+image::af_xdp_rings.png[AF_XDP Rings, 800]
+
+== Changes Made
+
+=== Kernel
+
+In the kernel, we added the logic in the XDP to forward the packets to user space via AF_XDP, when a neighbor cannot be found in the eBPF map. Also, we added an extra eBPF map of type `BPF_MAP_TYPE_XSKMAP`, to store the references of all the AF_XDP sockets.
+
+=== User Space
+
+In the user space program(Arion Agent), we added an AF_XDP module, which constantly pulls from the AF_XDP sockets for packets from the kernel, before processing them and sending them out.
+
+At the early stage of development, a single-threaded module was implemented. It uses one AF_XDP socket. In order to utilize the host resource as much as possible, a multi-threaded module was implemented, it leaves 8 cores for other applications on the same host, takes the rest of the cores and creates an AF_XDP socket on each core. Say, a machine has 24 cores, 16 cores will be used for the AF_XDP module and 16 AF_XDP sockets will be created.
+
+One concern we have for the kernel space is that, the size limit of the eBPF maps will be met some day, and then there will be no spaces to store the extra neigbhors/security group rules/other data we need. To address this concern, the first thing we thought of was to use the SQLite database for neighbor lookup. Tests were performed on the SQLite database and it can handle more than 1 million reads per second. However, during the test, we saw that the throughtput for the iPerf test was very very low, only around 10 Mbps, it is no match with the in-kernel XDP, which can achieves above 8 Gbps. 
+
+In order to find out where the bottleneck is, we perfed the Arion Agent and we found out that the DB lookup consumes the majority of the time during a packet's life cycle in the user space:
+
+image::flamegraph_db.svg[Flame Graph-Reading from DB, 800]
+
+If we look into the flame graph above, and focus on the flame on the left side, where the actually application was running on, we can see that the `db_client::GetNeighbor` was consuming most of the time. Also, in this function, most of the time was spent on reading the SQLite database(the `sqlite_orm` calls). We have to change this and achieve quicker lookup, in order to achieve better performance.
+
+We then tried to change the lookup from the database to a `ConcurrentHashMap`, then to a simple `std::unordered_map`. These two data structures are both in-memory, so the lookup is much quicker than the database lookup, which is on disk. We also perfed these two versions of Arion Agent, and we can see from the flame graph that the `db_client::GetNeighborInMemory` is taking less and less time:
+
+With `ConcurrentHashMap`:
+
+image::flamegraph_single_threaded.svg[Flame Graph-Reading from ConcurrentHashMap, 800]
+
+With `std::unordered_map`:
+
+image::flamegraph_single_threaded_unordered_map.svg[Flame Graph-Reading from std::unordered_map, 800]
+
+After the above changes, we are pleased to see that the performance of this AF_XDP module is now on par with the in-kernel XDP. Please refer to the next section for more details.
+
+== Performance
+
+
+=== Metrics and Tests
+
+There are some metrics that we care about when we evaluate a dataplane: Packets per second (PPS), latency and throughput. The higher the PPS and throughput, the better; also, the lower the latency, the better.
+
+The test environment involves two compute nodes and one Arion Wing node. On each node, there's a 10Gb NIC set up for the testing. Each compute node has two sets of VMs. The traffic for VMs with IP in CIDR 10.0.0.0/24 goes through the in-kernel XDP; the traffic for VMs with IP in CIDR 11.0.0.0/24 first goes through in-kernel XDP, before going through AF_XDP. This environment is very similar to the design and workflow graph, which is shown above.
+
+The ping command was used to measure the latency, and the iperf command was used to measure the throughput and PPS. We perform the same test to see the difference between the performance difference between in-kernel XDP and AF_XDP. Multiple rounds of tests were performed, in order to see the difference between AF_XDP with different number of sockets. The results are show in the table below.
+
+[options="header"]
+|=======================================================================================================================================================================================================================================
+| Test #  | Total # of CPU  | # of sockets  | ping latency AF (ms)  | ping latency kernel (ms)  | ping latency difference (%)  | iperf AF (Gbps)  | iperf kernel (Gbps)  | Throughput difference (%)  | Max PPS  | Max Throughput (mbps)
+| 1       | 24              | 1             | 0.623                 | 0.598                     | 4.180602007                  | 4.69             | 4.74                 | -1.054852321               | 859728   | 9691                 
+| 2       | 24              | 2             | 0.547                 | 0.635                     | -13.85826772                 | 4.58             | 4.98                 | -8.032128514               | 869994   | 9708                 
+| 3       | 24              | 4             | 0.629                 | 0.715                     | -12.02797203                 | 5.44             | 5.06                 | 7.509881423                | 855856   | 9433                 
+| 4       | 24              | 8             | 0.77                  | 0.752                     | 2.393617021                  | 5.86             | 5.53                 | 5.967450271                | 861414   | 9434                 
+| 5       | 24              | 16            | 0.673                 | 0.649                     | 3.697996918                  | 4.92             | 4.82                 | 2.074688797                | 842844   | 9354                 
+|=======================================================================================================================================================================================================================================
+
+== Conclusions
+
+The test performed above shows that AF_XDP is on par with the in-kernel XDP in terms of PPS, throughput and latency. In some tests, we see that AF_XDP outperforms the in-kernel XDP.
+
+However, we believe that we haven't found the limits of AF_XDP yet, as the test environment uses 10 Gb NICs, and we see that the max PPS for AF_XDP stays at the 800k level, understand different tests with different number of sockets. We can perform similar tests once we have a test environment that has more powerful NICs/switches.
+
